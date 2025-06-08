@@ -11,8 +11,10 @@ from twilio.rest import Client
 # Load environment variables from .env
 load_dotenv()
 
+
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1)  # Trust X-Forwarded-Proto for HTTPS detection
+
 
 # Twilio and OpenAI config
 

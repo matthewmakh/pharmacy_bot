@@ -36,7 +36,7 @@ if delivery:
     # Prepare message
     body = f"Hi {delivery['patient_name']}, we’re delivering your medication to:\n{delivery['delivery_address']} at {delivery['delivery_time']}.\nReply YES to confirm or NO if anything is wrong."
 
-    # Send SMS
+    ## Send SMS
     client = Client(twilio_sid, twilio_token)
     client.messages.create(
         body=body,
@@ -44,7 +44,7 @@ if delivery:
         to=delivery['phone_number']
     )
 
-    # Update status to avoid re-sending
+    ## Update status to avoid re-sending
     # Update status to avoid re-sending
     cursor.execute("""
         UPDATE deliveries

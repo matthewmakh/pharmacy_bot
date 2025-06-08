@@ -138,7 +138,7 @@ with st.form("add_delivery_form"):
 
 # =========================
 # SECTION 3: MESSAGE HISTORY
-# =========================
+## =========================
 st.subheader("📜 Message History")
 
 phone_options = get_all_phone_numbers()
