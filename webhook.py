@@ -7,25 +7,21 @@ import os
 import json
 from werkzeug.middleware.proxy_fix import ProxyFix
 from twilio.rest import Client
+from datetime import datetime
 
 # Load environment variables from .env
 load_dotenv()
 
-
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1)  # Trust X-Forwarded-Proto for HTTPS detection
 
-
 # Twilio and OpenAI config
-
 twilio_client = Client(
     os.getenv("TWILIO_ACCOUNT_SID"),
     os.getenv("TWILIO_AUTH_TOKEN")
 )
 twilio_number = os.getenv("TWILIO_PHONE_NUMBER")
-
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-
 validator = RequestValidator(TWILIO_AUTH_TOKEN)
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
@@ -39,7 +35,6 @@ db_config = {
 
 @app.route("/sms", methods=["POST"])
 def sms_reply():
-    # 🔒 Validate Twilio request
     twilio_signature = request.headers.get("X-Twilio-Signature", "")
     url = request.url
     post_vars = request.form.to_dict()
@@ -48,16 +43,13 @@ def sms_reply():
         print("❌ Invalid request signature — rejected.")
         return abort(403)
 
-    # ✅ Extract incoming message
     from_number = post_vars.get("From")
-    body = post_vars.get("Body", "").strip().lower()
+    body = post_vars.get("Body", "").strip()
     print(f"📩 Message from {from_number}: {body}")
 
-    # Connect to MySQL
     db = mysql.connector.connect(**db_config)
     cursor = db.cursor(dictionary=True)
 
-    # Find latest delivery for this number
     cursor.execute("""
         SELECT * FROM deliveries
         WHERE phone_number = %s AND status IN ('awaiting_confirmation', 'correction_requested')
@@ -68,154 +60,127 @@ def sms_reply():
 
     if not delivery:
         twilio_client.messages.create(
-            body="We couldn’t find any delivery associated with your number. Please wait for a new message or call us.",
+            body="Sorry we are having problems with our text system right now. Please give us a call at 917-584-5634.",
             from_=twilio_number,
             to=from_number
         )
         return "No matching delivery found", 200
 
-    # 🔍 Step 1: Let GPT classify the intent
-    print("🤖 Analyzing intent with GPT...")
+    cursor.execute("""
+        INSERT INTO message_history (phone_number, role, message)
+        VALUES (%s, 'user', %s)
+    """, (from_number, body))
+    db.commit()
 
-    intent_prompt = f"""
-A pharmacy sent a patient their delivery info. The patient replied:
+    normalized_body = body.lower().strip()
 
-"{body}"
+    if normalized_body == "yes":
+        cursor.execute("""
+            UPDATE deliveries SET status = 'ready' WHERE id = %s
+        """, (delivery["id"],))
+        db.commit()
+        reply = "Thanks! Your delivery has been confirmed."
+        cursor.execute("""
+            INSERT INTO message_history (phone_number, role, message)
+            VALUES (%s, 'assistant', %s)
+        """, (from_number, reply))
+        db.commit()
+        twilio_client.messages.create(body=reply, from_=twilio_number, to=from_number)
+        return reply, 200
 
-Classify this message strictly as one of the following single words:
-- "confirm" (if everything looks good)
-- "correction" (if they are requesting a change)
-- "unclear" (if it's ambiguous or cannot be determined)
+    if normalized_body == "no":
+        cursor.execute("""
+            UPDATE deliveries SET status = 'correction_requested' WHERE id = %s
+        """, (delivery["id"],))
+        db.commit()
+        reply = "Got it. Is it the delivery address or time you’d like to change?"
+        cursor.execute("""
+            INSERT INTO message_history (phone_number, role, message)
+            VALUES (%s, 'assistant', %s)
+        """, (from_number, reply))
+        db.commit()
+        twilio_client.messages.create(body=reply, from_=twilio_number, to=from_number)
+        return reply, 200
 
-Only return one of those three words — no explanation.
-"""
+    cursor.execute("""
+        SELECT role, message FROM message_history
+        WHERE phone_number = %s
+        ORDER BY created_at DESC
+        LIMIT 5
+    """, (from_number,))
+    messages = cursor.fetchall()[::-1]
+
+    context = [{"role": m["role"], "content": m["message"]} for m in messages]
+    context.append({"role": "user", "content": body})
 
     try:
+        # Step 1: Get assistant response
         response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[{"role": "user", "content": intent_prompt}],
-            temperature=0
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": (
+                    "You are a smart and friendly chatbot helping patients correct or confirm pharmacy deliveries.\n"
+                    "Users may reply with vague phrases like 'address', 'zip code', 'time', etc.\n"
+                    "Gently guide them to provide the missing information.\n"
+                    "If the needed info is clear, respond naturally.\n"
+                    "You must always guide toward confirming or correcting one of these: delivery address or delivery time.\n"
+                    "Once a correction is received, do not ask the user if there's anything else to correct. Once a correction is received, confirm the update clearly and politely, and end the conversation. Never prompt for more input."
+                )},
+                *context
+            ]
         )
-        intent = response.choices[0].message.content.strip().lower()
-        print(f"🔍 GPT classified intent as: {intent}")
-    except Exception as e:
-        print("❌ GPT classification failed:", e)
-        return "Sorry, we couldn't understand your message.", 200
-
-    # 🔀 Step 2: Handle logic based on GPT intent
-    if intent == "confirm":
+        reply = response.choices[0].message.content.strip()
         cursor.execute("""
-            UPDATE deliveries
-            SET status = 'ready'
-            WHERE id = %s
-        """, (delivery['id'],))
+            INSERT INTO message_history (phone_number, role, message)
+            VALUES (%s, 'assistant', %s)
+        """, (from_number, reply))
         db.commit()
-        print("✅ Marked as ready via GPT intent.")
-        twilio_client.messages.create(
-            body="Thanks! We’ve marked it as ready.",
-            from_=twilio_number,
-            to=from_number
+        twilio_client.messages.create(body=reply, from_=twilio_number, to=from_number)
+
+        # Step 2: Try extracting corrections
+        extract = client.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": "Return a JSON object with any updated delivery_address or delivery_time."},
+                *context
+            ],
+            functions=[{
+                "name": "extract_update",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "delivery_address": {"type": "string"},
+                        "delivery_time": {"type": "string"}
+                    }
+                }
+            }],
+            function_call="auto"
         )
-        return "Thanks! We’ve marked it as ready.", 200
 
-    elif intent == "correction":
-        cursor.execute("""
-            UPDATE deliveries
-            SET status = 'correction_requested'
-            WHERE id = %s
-        """, (delivery['id'],))
-        db.commit()
-        print("⚠️ Marked as correction_requested via GPT intent.")
-        twilio_client.messages.create(
-            body="Got it. What needs to be corrected?",
-            from_=twilio_number,
-            to=from_number
-        )
-        return "Got it. What needs to be corrected?", 200
-
-    else:
-        print("🤖 Intent was unclear — sending full prompt for correction extraction...")
-
-        correction_prompt = f"""
-You're an AI assistant helping a pharmacy confirm deliveries. Here's the original delivery info:
-
-Name: {delivery['patient_name']}
-Address: {delivery['delivery_address']}
-Time: {delivery['delivery_time']}
-
-The patient replied: "{body}"
-
-Determine if the message includes a correction to the address or time.
-If it does, return a JSON object like:
-{{
-    "delivery_address": "new address if corrected, else null",
-    "delivery_time": "new time if corrected, else null"
-}}
-
-If there's nothing to change, return:
-{{
-    "delivery_address": null,
-    "delivery_time": null
-}}
-"""
-
-        try:
-            response = client.chat.completions.create(
-                model="gpt-3.5-turbo",
-                messages=[{"role": "user", "content": correction_prompt}],
-                temperature=0.3
-            )
-            reply = response.choices[0].message.content.strip()
-            print("🧠 GPT response:", reply)
-
-            correction = json.loads(reply)
+        if extract.choices[0].message.function_call:
+            args = json.loads(extract.choices[0].message.function_call.arguments)
             updates = []
             values = []
-
-            if correction["delivery_address"]:
+            if "delivery_address" in args:
                 updates.append("delivery_address = %s")
-                values.append(correction["delivery_address"])
-
-            if correction["delivery_time"]:
+                values.append(args["delivery_address"])
+            if "delivery_time" in args:
                 updates.append("delivery_time = %s")
-                values.append(correction["delivery_time"])
-
+                values.append(args["delivery_time"])
             if updates:
                 updates.append("correction_note = %s")
-                values.append(body)
-                values.append(delivery['id'])
-
-                update_query = f"""
-                    UPDATE deliveries
-                    SET {', '.join(updates)},
-                        status = 'ready'
-                    WHERE id = %s
-                """
-                cursor.execute(update_query, values)
+                values.append(f"{body} — fixed on {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+                values.append(delivery["id"])
+                cursor.execute(f"UPDATE deliveries SET {', '.join(updates)}, status = 'ready' WHERE id = %s", values)
                 db.commit()
-                print("✅ Updated delivery with GPT corrections.")
-                twilio_client.messages.create(
-                    body="Thanks! We’ve updated your delivery as requested.",
-                    from_=twilio_number,
-                    to=from_number
-                )
-                return "Thanks! We’ve updated your delivery as requested.", 200
-            else:
-                twilio_client.messages.create(
-                    body="Thanks! No changes were needed.",
-                    from_=twilio_number,
-                    to=from_number
-                )
-                return "Thanks! No changes were needed.", 200
 
-        except Exception as e:
-            print("❌ GPT correction logic failed:", e)
-            twilio_client.messages.create(
-                body="Sorry, we had trouble understanding that. A human will review it.",
-                from_=twilio_number,
-                to=from_number
-            )
-            return "Sorry, we had trouble understanding that. A human will review it.", 200
+        return reply, 200
+
+    except Exception as e:
+        print("❌ GPT or DB error:", e)
+        fallback = "Sorry, we had trouble understanding that. A human will follow up."
+        twilio_client.messages.create(body=fallback, from_=twilio_number, to=from_number)
+        return fallback, 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5001)
